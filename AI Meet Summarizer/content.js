@@ -1,5 +1,3 @@
-// content.js - AI Meet Summariser Content Script
-
 let isCapturing = false;
 let observer = null;
 let stabilityInterval = null;
@@ -35,7 +33,7 @@ function getMeetingTitle() {
     '.u6vdEc',
     'h1'
   ];
-  
+
   for (const selector of titleSelectors) {
     const el = document.querySelector(selector);
     if (el) {
@@ -46,7 +44,7 @@ function getMeetingTitle() {
       }
     }
   }
-  
+
   if (!meetingTitle || meetingTitle.includes("Google Meet")) {
     const pathname = window.location.pathname.replace(/^\//, "");
     meetingTitle = pathname ? `Meet ${pathname}` : `Google Meet - ${new Date().toLocaleDateString()}`;
@@ -97,16 +95,46 @@ function getSpeakerName(item) {
 
 // Get caption text from caption block
 function getCaptionText(item) {
-  const el = item.querySelector(SELECTORS.text) || 
-             [...item.children].reverse().find((child) => child.tagName === "DIV" && !child.querySelector(SELECTORS.avatar));
+  const el = item.querySelector(SELECTORS.text) ||
+    [...item.children].reverse().find((child) => child.tagName === "DIV" && !child.querySelector(SELECTORS.avatar));
   return el ? normalize(el.textContent) : "";
 }
 
 // --- Transcript Storage & Sync ---
 
 function saveTranscriptState() {
+  // Clone finalizedTranscript
+  const combined = JSON.parse(JSON.stringify(finalizedTranscript));
+
+  // Sort active turns by startTime
+  const activeList = [...activeTurns.values()].sort((a, b) => a.startTime - b.startTime);
+
+  for (const entry of activeList) {
+    if (!entry.text) continue;
+    const lastIndex = combined.length - 1;
+    if (lastIndex >= 0 && combined[lastIndex].speaker === entry.speaker) {
+      const prevTurn = combined[lastIndex];
+      const text = entry.text;
+      if (text === prevTurn.text || prevTurn.text.endsWith(text)) {
+        // Ignore duplicate
+      } else if (text.startsWith(prevTurn.text)) {
+        prevTurn.text = text;
+      } else {
+        prevTurn.text += " " + text;
+      }
+    } else {
+      combined.push({
+        speaker: entry.speaker,
+        text: entry.text,
+        time: entry.time,
+        elapsed: entry.elapsed,
+        timestamp: entry.startTime
+      });
+    }
+  }
+
   chrome.storage.local.set({
-    meetTranscript: finalizedTranscript,
+    meetTranscript: combined,
     meetingTitle: getMeetingTitle(),
     lastUpdated: Date.now()
   });
@@ -120,20 +148,8 @@ function notifyBackgroundStatus() {
 }
 
 // Finalizes a turn and pushes it to the finalized list
-function finalizeTurn(el, entry) {
-  if (entry.finalized) return;
-  
-  const text = getCaptionText(el);
-  if (!text) return;
-  
-  entry.text = text;
-  entry.finalized = true;
-
-  const timestamp = new Date(entry.startTime).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
-  const elapsedMs = entry.startTime - startTime;
-  const elapsedMin = Math.floor(elapsedMs / 60000);
-  const elapsedSec = Math.floor((elapsedMs % 60000) / 1000);
-  const timeLabel = `${elapsedMin}:${elapsedSec.toString().padStart(2, "0")}`;
+function finalizeTurn(entry) {
+  if (!entry.text) return;
 
   // Add to finalized list, merging consecutive inputs from the same speaker
   const lastIndex = finalizedTranscript.length - 1;
@@ -153,8 +169,8 @@ function finalizeTurn(el, entry) {
     finalizedTranscript.push({
       speaker: entry.speaker,
       text: entry.text,
-      time: timestamp,
-      elapsed: timeLabel,
+      time: entry.time,
+      elapsed: entry.elapsed,
       timestamp: entry.startTime
     });
   }
@@ -169,25 +185,33 @@ function trackCaptionItem(el) {
 
   const speaker = getSpeakerName(el);
   const text = getCaptionText(el);
+  const startTimeVal = Date.now();
+
+  const timestamp = new Date(startTimeVal).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+  const elapsedMs = startTimeVal - startTime;
+  const elapsedMin = Math.floor(elapsedMs / 60000);
+  const elapsedSec = Math.floor((elapsedMs % 60000) / 1000);
+  const timeLabel = `${elapsedMin}:${elapsedSec.toString().padStart(2, "0")}`;
 
   activeTurns.set(el, {
     speaker,
     text,
-    startTime: Date.now(),
-    staleTicks: 0,
-    finalized: false
+    startTime: startTimeVal,
+    time: timestamp,
+    elapsed: timeLabel
   });
+
+  saveTranscriptState();
 }
 
 function updateCaptionItem(el) {
   const entry = activeTurns.get(el);
-  if (!entry || entry.finalized) return;
+  if (!entry) return;
 
   const currentText = getCaptionText(el);
   if (entry.text !== currentText) {
     entry.text = currentText;
-    entry.staleTicks = 0;
-    
+
     // Save live caption state for popup
     chrome.storage.local.set({
       liveCaption: {
@@ -195,8 +219,8 @@ function updateCaptionItem(el) {
         text: currentText
       }
     });
-  } else {
-    entry.staleTicks++;
+
+    saveTranscriptState();
   }
 }
 
@@ -243,7 +267,7 @@ function startCapture() {
         for (const item of items) {
           const entry = activeTurns.get(item);
           if (entry) {
-            finalizeTurn(item, entry);
+            finalizeTurn(entry);
             activeTurns.delete(item);
           }
         }
@@ -269,18 +293,12 @@ function startCapture() {
   // Track existing caption blocks
   getCaptionItems(region).forEach(trackCaptionItem);
 
-  // 2. Poll every 1 second for stability detection
+  // 2. Poll every 1 second for stability/live checks
   stabilityInterval = setInterval(() => {
-    for (const [el, entry] of activeTurns.entries()) {
-      if (!entry.finalized) {
-        updateCaptionItem(el);
-        // If text is stable for 3 seconds, finalize it
-        if (entry.staleTicks >= 3) {
-          finalizeTurn(el, entry);
-        }
-      }
+    for (const el of activeTurns.keys()) {
+      updateCaptionItem(el);
     }
-    
+
     // Clear live caption in storage if no active turns
     if (activeTurns.size === 0) {
       chrome.storage.local.set({ liveCaption: null });
@@ -309,8 +327,8 @@ function stopCapture() {
   }
 
   // Finalize all remaining active turns
-  for (const [el, entry] of activeTurns.entries()) {
-    finalizeTurn(el, entry);
+  for (const entry of activeTurns.values()) {
+    finalizeTurn(entry);
   }
   activeTurns.clear();
 
